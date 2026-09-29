@@ -1,0 +1,7 @@
+# dsh-skill-manager bundle 层：插入「Skill 管理」插件行。
+# host 半提供 /skill-manager/api（列表、启停、删除、定位、预览），
+# client 半往 settings.section 注册一个设置分区（order 30，「Agent 预设」之后）。
+- insert:
+    - id: dsh-skill-manager
+      name: 'dsh-skill-manager'
+      config: {}
