@@ -1,6 +1,6 @@
 {
   "name": "dsh-skill-manager",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "在 DSH 设置面板里加一个「Skill 管理」分区：列出本机可用的 agent skill（含来源与生效状态），并支持启用、禁用、定位与删除。",
   "license": "MIT",

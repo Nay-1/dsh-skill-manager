@@ -237,9 +237,9 @@ console.log("\n渲染");
  * 会悄悄溜过去 —— 所以这里补上同样的校验。
  */
 let lastHookCount;
-const render = () => {
+const render = (props) => {
   cursor = 0;
-  const element = entry.component({});
+  const element = entry.component(props ?? {});
   if (lastHookCount !== undefined && cursor !== lastHookCount) {
     throw new Error(
       `hooks 数量不一致：上一次 ${lastHookCount} 个，这一次 ${cursor} 个`
@@ -250,12 +250,12 @@ const render = () => {
   return element;
 };
 const flushEffects = () => { const queue = pendingEffects; pendingEffects = []; for (const effect of queue) effect(); };
-const settle = async (rounds = 8) => {
-  let tree = render();
+const settle = async (rounds = 8, props) => {
+  let tree = render(props);
   for (let index = 0; index < rounds; index += 1) {
     flushEffects();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    if (dirty) { dirty = false; tree = render(); }
+    if (dirty) { dirty = false; tree = render(props); }
   }
   return tree;
 };
@@ -409,6 +409,47 @@ console.log("\n交互");
   tree = await settle();
   check("查看 -> POST /read", fetchCalls.some((call) => String(call.url).endsWith("/read")));
   check("正文渲染在 pre 里", byClass(tree, "dsm-preview")[0] !== undefined && textOf(byClass(tree, "dsm-preview")[0]).includes("# hello skill"));
+}
+
+{
+  // 刷新后，清单里已经不存在的 skill 的预览要被清掉，别留着过期的键
+  listPayload = {
+    ...fixture,
+    result: { ...fixture.result, skills: fixture.result.skills.filter((skill) => skill.name !== "find-skills") }
+  };
+  buttonByText(tree, "刷新").props.onClick();
+  tree = await settle(3);
+  check("清单里没有的 skill，预览被清掉", byClass(tree, "dsm-preview").length === 0, byClass(tree, "dsm-preview").length);
+
+  listPayload = fixture;
+  buttonByText(tree, "刷新").props.onClick();
+  tree = await settle(3);
+  check("恢复清单后卡片回来了", byClass(tree, "dsm-card").length === 5, byClass(tree, "dsm-card").length);
+}
+
+{
+  /* 宿主每次渲染都换一个新的 t：不能让 load 跟着换身份，否则会
+     "拉列表 → setState → 重渲染 → 再拉列表" 死循环。 */
+  const zhDict = dictionaries.at(-1)?.zh ?? {};
+  const stubT = (key, params) => {
+    const template = zhDict[key] ?? key;
+    if (params === undefined) return template;
+    return Object.keys(params).reduce((text, name) => text.split(`{${name}}`).join(String(params[name])), template);
+  };
+  const listCalls = () => fetchCalls.filter((call) => (call.options?.method ?? "GET") === "GET" && String(call.url).endsWith("/list")).length;
+
+  const before = listCalls();
+  let treeWithProps;
+  for (let index = 0; index < 4; index += 1) {
+    treeWithProps = render({ t: (key, params) => stubT(key, params) }); // 每次都是新的函数身份
+    flushEffects();
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const after = listCalls();
+  check("宿主每次换 t 也不会重复拉列表", after === before, `${before} -> ${after}`);
+  check("换 t 后页面照常渲染",
+    byClass(treeWithProps, "dsm-section").length === 1 && textOf(treeWithProps).includes("Skill 管理"));
+  tree = await settle(3);
 }
 
 {

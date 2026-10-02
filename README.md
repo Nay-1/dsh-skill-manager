@@ -33,25 +33,30 @@
 | 按钮 | 出现条件 | 干什么 |
 |---|---|---|
 | 启用 / 禁用 | 文件系统上可写的 skill | `SKILL.md` ⇄ `SKILL.md.disabled` 改名（可逆） |
-| 打开目录 | 磁盘上存在的 skill | 资源管理器定位到它 |
-| 查看 / 收起 | 磁盘上存在的 skill | 就地预览 `SKILL.md` 正文 |
+| 打开目录 | 有路径的 skill（磁盘上的，或注册表 `resourceBase` 报出目录的） | 资源管理器定位到它（平铺文件用 `/select,` 选中，不是打开） |
+| 查看 / 收起 | 有路径的 skill | 就地预览 `SKILL.md` 正文 |
 | 删除 | 文件系统上可写的 skill | 删掉整个 skill（**内联二次确认**，不可恢复） |
 
 一屏只留一个"实体按钮"（启用/禁用，描边），定位、预览、删除都做成轻量文字动作。
 
-随包内置的（bundled）与运行时 provider 提供的 skill 只展示、只读。
+随包内置的（bundled）与运行时 provider 提供的 skill 是**只读**的：能定位、能预览，
+但没有启用/禁用与删除按钮（宿主侧也照样 403）。
 
 ## 它怎么认 skill
 
 DSH 的 skill 是文件系统资源，插件的扫描规则与 `@deepseek-ai/dsh-skill-filesystem` 对齐：
 
-| 根目录 | source | rank |
+| 根目录 | source | 显示权重 |
 |---|---|---|
 | `<项目>/.dsh/skills` | `project-dsh` | 100 |
 | `<项目>/.agents/skills` | `project-agents` | 200 |
 | `$DSH_HOME/skills`（默认 `~/.dsh/skills`） | `user-dsh` | 400 |
 | `$DSH_AGENTS_HOME/skills`（默认 `~/.agents/skills`） | `user-agents` | 500 |
 | `$DSH_BUNDLED_SKILL_DIR` | `bundled` | 600 |
+
+> 这几个数字只是**本插件排显示顺序**用的权重。公共契约里的 `SkillSummary` 并不带 rank
+> （rank / locator 只属于 provider 层的 `SkillCandidate`，注册表不往外给），所以它跟
+> provider 内部的名次没有可比性。
 
 项目根取 DSH 进程的工作目录，外加工作区账本（`ctx.workspaceRegistry`）里登记过的每个路径。
 
@@ -66,6 +71,15 @@ DSH 的 skill 是文件系统资源，插件的扫描规则与 `@deepseek-ai/dsh
 两者缺一不可：被禁用的 skill 只存在于磁盘上（注册表看不到它），而运行时 provider 的 skill
 只存在于注册表里（没有文件）。页面会标出每个条目的来源；注册表整个不可用时，页面会明确提示
 "现在只有磁盘扫描结果"。
+
+合并**只按路径**认领：注册表条目要么带顶层 `path`，要么带
+`resourceBase: { kind: 'directory', path }`（bundled provider 实测就是后者）。
+认领不到就各自成条 —— 以前还按"条目名"兜底，那会把"注册表里活着的 `foo`"错挂到
+"磁盘上已禁用的 `foo`"：页面显示已禁用，按钮却去改另一个文件。宁可多一条只读条目，
+也不张冠李戴。
+
+注册表报出来的目录（bundled 等）不在任何扫描根里，所以另开一条**只读通道**：
+`read` / `reveal` 放行，`toggle` / `delete` 依旧 403，而且只认注册表**当次**报出来的路径。
 
 > **实测结论（0.2.0-rc.2）**：宿主插件上下文里的 `ctx.skills.list()` **只返回随包内置与运行时
 > provider 的 skill**，看不到 `skill-filesystem` 提供的那批 —— DSH 的 skill 注册表可以由 agent
@@ -91,7 +105,15 @@ DSH 本身没有 skill 开关。这里用**改名**实现，且是双向可逆�
 - 目标必须落在已知 skill 根目录**之内**；
 - 必须是根下**一层**的 skill 条目（目录包或平铺文件），根目录自身不行；
 - `bundled` 根下的一律拒绝（403）；
-- 客户端传的路径先 `resolve()` 规范化，`..` 穿越会被前缀检查挡掉。
+- 客户端传的路径先 `resolve()` 规范化，`..` 穿越会被前缀检查挡掉；
+- 注册表目录那条只读通道只认注册表当次报出来的路径，且只放行 `read` / `reveal`；
+- 路径比较的大小写敏感性跟平台走（Windows / macOS 不敏感，Linux 敏感），
+  不会出现"去重按小写、前缀检查按原样"的两套标准。
+
+写接口另有一道**跨站防线**：`content-type` 不是 `application/json`、且 `Origin` 又对不上
+`Host` 的请求直接 403。浏览器发起的跨站"简单请求"只能带 `text/plain` 这类 content-type，
+正好被挡住；带 JSON 的跨站请求会先触发预检，而本服务没有 CORS 应答，浏览器自己就挡了。
+本页面永远发 JSON，本机脚本通常不带 `Origin`，都不受影响。
 
 ## HTTP API
 
@@ -106,6 +128,9 @@ DSH 本身没有 skill 开关。这里用**改名**实现，且是双向可逆�
 | POST | `/delete` | `{ target }` → 删除 |
 | POST | `/read` | `{ target }` → 返回 `SKILL.md` 正文（>512 KB 拒绝） |
 | POST | `/reveal` | `{ target }` → 资源管理器定位（仅 Windows） |
+
+`/list` 里每个 cwd 的注册表查询是**并发**发起的，整体共用一个 8 秒 deadline：
+provider 卡住也不会把一次 `/list` 挂成分钟级（以前是串行 N × 8 秒）。
 
 ## 安装
 
@@ -150,8 +175,8 @@ dsh-skill-manager/
 ├── cordis.patch.yml      bundle 层：插入本插件
 ├── lib/index.js          host 半：扫描 + HTTP API + 文件动作
 ├── lib/client.js         client 半：settings.section 页面
-├── test-host.mjs         host 半自测（62 项）
-└── test-client.mjs       client 半自测（43 项）
+├── test-host.mjs         host 半自测（90 项）
+└── test-client.mjs       client 半自测（67 项）
 ```
 
 ```powershell
@@ -168,3 +193,33 @@ node test-client.mjs    # mock Module Loader / React / fetch，真渲染一遍�
 - **删除就是删除**：`rm -rf` 掉 skill 目录，没有回收站。
 - 预览只显示 `SKILL.md` 原文（不渲染 Markdown），够用来核对内容。
 - 非 Windows 平台没有"打开目录"，接口会返回 `revealed: false`。
+- **符号链接不跟随**：`readdir` 的 `Dirent` 对 symlink / junction 既不报目录也不报文件，
+  所以链接形式的 skill 条目会被跳过（provider 是否跟随未验证，故不擅自扩大范围）。
+- 扫描规则（平铺 `<name>.md`、`.system` 跳过、rank 数值）是与
+  `@deepseek-ai/dsh-skill-filesystem` **对齐的约定**，但该 provider 不在公共契约里，
+  升级 DSH 后值得重新核对一次。
+
+## 修复记录
+
+### 1.1.0
+
+- **修**：CRLF 的 `SKILL.md` 会丢掉 frontmatter **最后一行**的字段。切出来的 body 末尾留着
+  一个 `\r`，而 JS 正则的 `.` 不匹配 `\r`，`(.*)$` 于是整行匹配失败 —— `description`
+  约定俗成就写在最后一行，所以受伤的几乎总是它（实测本机 5 个用户 skill 里 3 个描述为空）。
+  顺带兼容带 BOM 的文件（`startsWith("---")` 曾经直接失败）。解析前统一归一化行尾。
+- **修**：合并注册表与磁盘时不再按"条目名"兜底，只认路径（`path` 或 `resourceBase`）。
+  以前同名条目会被错挂：注册表里活着的 `foo` 显示成"已禁用"，按钮却指向磁盘上另一个 `foo`。
+- **改**：认 `resourceBase: { kind: 'directory', path }`（bundled provider 实测用这个，
+  顶层 `path` 反而没有），于是随包内置的 skill 在页面上有了路径，可以**定位与预览**；
+  启停 / 删除仍然 403（新增一条只读通道，只认注册表当次报出来的路径）。
+- **改**：`/list` 的注册表查询改成并发 + 单一 8 秒 deadline（原来串行 N × 8 秒）。
+- **删**：按 `rank` 挑同名注册表条目的死代码 —— `SkillSummary` 根本没有 rank，那行比较恒为假。
+- **修**：`explorer.exe` 定位平铺技能时改用 `/select,<路径>`（原来会把 `.md` 直接打开），
+  并且等到真的 spawn 成功才报 `revealed: true`。
+- **加**：写接口的跨站防线（`content-type` + `Origin`）。
+- **修**：客户端 `load` 不再依赖 `t` 的身份 —— 宿主若每次渲染换一个新的 `t`，
+  原来会"拉列表 → setState → 重渲染 → 再拉列表"死循环（测试里已能复现：2 → 6 次）。
+- **改**：预览缓存随刷新清理孤儿键；样式标签改成随插件卸载移除。
+- **修**：路径比较的大小写一致性；平铺技能的启停日志不再打印根目录名。
+- 测试从 62 + 43 项扩到 **90 + 67** 项，新增 CRLF / BOM / 同名冲突 / `resourceBase` /
+  只读通道 / 跨站请求 / 单 cwd 失败降级 / `t` 身份稳定性 / 预览清理等用例。

@@ -64,19 +64,63 @@ await writeSkill(skillFile(join(bundled, "office-docx")), "name: office-docx\nde
 // 项目根下的 skill
 await writeSkill(skillFile(join(project, ".agents", "skills", "proj-skill")), "name: proj-skill\ndescription: Project scoped.");
 
+// CRLF：description 是 frontmatter 的最后一行。JS 正则的 `.` 不匹配 `\r`，
+// 所以切出来的 body 末尾那个 \r 曾经让整行解析失败（真实机器上 3/5 个用户 skill 中招）。
+await mkdir(join(userAgents, "crlf-skill"), { recursive: true });
+await writeFile(
+  skillFile(join(userAgents, "crlf-skill")),
+  "---\r\nname: crlf-skill\r\ndescription: Written with CRLF line endings.\r\n---\r\n\r\n# body\r\n",
+  "utf8"
+);
+
+// BOM：PowerShell 5.1 的 UTF8 写入就带 BOM，startsWith("---") 曾经直接失败。
+await mkdir(join(userAgents, "bom-skill"), { recursive: true });
+await writeFile(
+  skillFile(join(userAgents, "bom-skill")),
+  "\uFEFF---\nname: bom-skill\ndescription: Written with a BOM.\n---\n\n# body\n",
+  "utf8"
+);
+
+// 与注册表同名、但磁盘上已禁用：只按路径认领，两者必须各自成行（放在 userDsh 是为了
+// 让它与 legacy-tool 同 rank，排序断言里的"禁用项排最后"仍然成立）。
+await writeSkill(join(userDsh, "ghost-skill", "SKILL.md.disabled"), "name: ghost-skill\ndescription: Disabled on disk.");
+
+// 注册表专属目录：不在任何扫描根里，只有只读通道能碰到它
+await writeSkill(skillFile(join(root, "registry-only", "remote-skill")), "name: remote-skill\ndescription: Registered from a provider directory.");
+
 // ---- 环境与 mock ctx -----------------------------------------------------
 process.env.DSH_HOME = dshHome;
 process.env.DSH_AGENTS_HOME = agentsHome;
 process.env.DSH_BUNDLED_SKILL_DIR = bundled;
 process.chdir(project);
 
+const project2 = join(root, "project2");
+const bundledSkillDir = join(bundled, "office-docx");
+const registryOnlyDir = join(root, "registry-only", "remote-skill");
+
+/**
+ * 注册表行的形状照抄真实契约（`SkillSummary`）：name / description / invocation /
+ * source / provider / resourceBase —— **没有 rank，也没有 locator**。
+ * 老夹具里塞了 `rank: 600`，等于把"按 rank 挑同名条目"这个错误假设一起固化了。
+ */
 const registryRows = [
-  { name: "acl-doctor", description: "Runtime provided skill.", provider: "win32-acl", source: "runtime", rank: 600, invocation: { modelInvocable: true, userInvocable: true } }
+  { name: "acl-doctor", description: "Runtime provided skill.", provider: "win32-acl", source: "runtime", invocation: { modelInvocable: true, userInvocable: true } },
+  // bundled provider 实测报的是 resourceBase（不是顶层 path）
+  { name: "office-docx", description: "Word documents.", provider: "dsh-office", source: "bundled", invocation: { modelInvocable: true, userInvocable: true }, resourceBase: { kind: "directory", path: bundledSkillDir } },
+  // 注册表专属目录：只有 read / reveal 走得通
+  { name: "remote-skill", description: "Registered from a provider directory.", provider: "remote-provider", source: "runtime", invocation: { modelInvocable: true, userInvocable: true }, resourceBase: { kind: "directory", path: registryOnlyDir } },
+  // 同名但没有路径：绝不能跟磁盘上那条已禁用的 ghost-skill 合并
+  { name: "ghost-skill", description: "Live in the registry, no path.", provider: "ghost-provider", source: "runtime", invocation: { modelInvocable: true, userInvocable: true } }
 ];
 
 const services = {
-  skills: { list: async () => registryRows },
-  workspaceRegistry: { list: () => [{ path: project }] }
+  skills: {
+    list: async (options) => {
+      if (options?.cwd === project2) throw new Error("provider 在这个 cwd 炸了");
+      return registryRows;
+    }
+  },
+  workspaceRegistry: { list: () => [{ path: project }, { path: project2 }] }
 };
 
 const registered = [];
@@ -95,10 +139,11 @@ mod.apply(ctx);
 check("注册了一个 prefix 路由", registered.length === 1 && registered[0].kind === "prefix" && registered[0].path === API_PREFIX);
 const handler = registered[0].handler;
 
-const call = async (method, path, body) => {
+const call = async (method, path, body, headers) => {
   const req = {
     method,
     url: `${API_PREFIX}${path}`,
+    headers: headers ?? {},
     async *[Symbol.asyncIterator]() {
       if (body !== undefined) yield Buffer.from(JSON.stringify(body), "utf8");
     }
@@ -159,6 +204,32 @@ let listed;
   const multi = listed.skills.find((skill) => skill.name === "multi-line");
   check("折叠 description 被展开", multi?.description === "Folded line one and line two.", multi?.description);
   check("whenToUse 被解析", multi?.whenToUse === "When testing folded YAML.", multi?.whenToUse);
+
+  // 回归：CRLF / BOM 的 frontmatter 曾经整行解析不出来（description 恰好是最后一行）
+  const crlf = listed.skills.find((skill) => skill.name === "crlf-skill");
+  check("CRLF 文件的 description 不再丢", crlf?.description === "Written with CRLF line endings.", JSON.stringify(crlf?.description));
+  const bom = listed.skills.find((skill) => skill.name === "bom-skill");
+  check("带 BOM 的文件也能解析", bom?.description === "Written with a BOM.", JSON.stringify(bom?.description));
+
+  // 回归：同名条目不再按名字张冠李戴
+  const ghosts = listed.skills.filter((skill) => skill.name === "ghost-skill");
+  check("同名不再合并：注册表行与磁盘行各自成条", ghosts.length === 2,
+    JSON.stringify(ghosts.map((skill) => ({ disabled: skill.disabled, managed: skill.managed, target: skill.target }))));
+  check("磁盘那条仍是已禁用 + 可管理", ghosts.some((skill) => skill.disabled === true && skill.managed === true && typeof skill.target === "string"));
+  check("注册表那条不带 target、不可管理", ghosts.some((skill) => skill.disabled === false && skill.managed === false && skill.target === undefined));
+
+  // resourceBase 认领磁盘条目：bundled 行拿到了目录，且不重复
+  check("bundled 行没有重复", listed.skills.filter((skill) => skill.name === "office-docx").length === 1);
+  const officeByBase = listed.skills.find((skill) => skill.name === "office-docx");
+  check("bundled 行被 resourceBase 认领到目录", officeByBase?.target === bundledSkillDir, officeByBase?.target);
+  check("bundled 行仍不可管理", officeByBase?.managed === false);
+
+  // 注册表专属目录：有路径、可定位，但不可管理
+  const remote = listed.skills.find((skill) => skill.name === "remote-skill");
+  check("注册表专属目录列出来了", remote !== undefined);
+  check("注册表专属目录有路径但不可管理",
+    remote?.managed === false && remote?.target === registryOnlyDir && remote?.inRegistry === true,
+    JSON.stringify(remote));
 
   check("禁用的排在最后", listed.skills[listed.skills.length - 1].name === "legacy-tool", listed.skills.map((s) => s.name).join(","));
   check("registryAvailable=true", listed.registryAvailable === true);
@@ -247,6 +318,47 @@ console.log("\n安全边界");
   check("reveal 越界 403（不会拉起资源管理器）", revealOutside.status === 403);
 }
 
+// ---- 注册表目录：只读通道 -------------------------------------------------
+console.log("\n注册表目录：只读通道");
+{
+  const read = await call("POST", "/read", { target: registryOnlyDir });
+  check("注册表目录可读 200", read.status === 200 && String(read.payload?.result?.content ?? "").includes("remote-skill"),
+    JSON.stringify(read.payload).slice(0, 160));
+
+  const bundledRead = await call("POST", "/read", { target: bundledSkillDir });
+  check("bundled 目录可读 200", bundledRead.status === 200 && String(bundledRead.payload?.result?.content ?? "").includes("office-docx"));
+
+  const del = await call("POST", "/delete", { target: registryOnlyDir });
+  check("注册表目录不可删 403", del.status === 403, JSON.stringify(del.payload));
+  const tog = await call("POST", "/toggle", { target: registryOnlyDir });
+  check("注册表目录不可启停 403", tog.status === 403);
+  check("目录还在", existsSync(skillFile(registryOnlyDir)));
+
+  const parent = await call("POST", "/read", { target: join(root, "registry-only") });
+  check("注册表目标的父目录仍 403（只认技能目录本身）", parent.status === 403, JSON.stringify(parent.payload));
+}
+
+// ---- 写接口的跨站防线 -----------------------------------------------------
+console.log("\n跨站写请求");
+{
+  const target = join(userAgents, "find-skills");
+
+  const blocked = await call("POST", "/toggle", { target }, { origin: "http://evil.example", "content-type": "text/plain" });
+  check("跨站简单请求 403", blocked.status === 403, JSON.stringify(blocked.payload));
+  check("被拒后文件没被动过", existsSync(skillFile(target)));
+
+  const pageLike = await call("POST", "/toggle", { target }, { origin: "http://evil.example", "content-type": "application/json" });
+  check("JSON 请求照旧放行（不误伤本页面）", pageLike.status === 200, JSON.stringify(pageLike.payload));
+  await call("POST", "/toggle", { target });
+
+  const sameOrigin = await call("POST", "/toggle", { target },
+    { origin: "http://127.0.0.1:19387", host: "127.0.0.1:19387", "content-type": "text/plain" });
+  check("同源 text/plain 放行", sameOrigin.status === 200, JSON.stringify(sameOrigin.payload));
+  await call("POST", "/toggle", { target });
+
+  check("测试收尾后仍是启用态", existsSync(skillFile(target)) && !existsSync(`${skillFile(target)}.disabled`));
+}
+
 // ---- /delete -------------------------------------------------------------
 console.log("\n/delete");
 {
@@ -257,6 +369,15 @@ console.log("\n/delete");
   check("目录真的没了", !existsSync(dir));
   const names = (await call("GET", "/list")).payload.result.skills.map((skill) => skill.name);
   check("列表里也不再有它", !names.includes("legacy-tool"));
+}
+
+// ---- 部分 cwd 查询失败 -----------------------------------------------------
+console.log("\n降级：某个 cwd 的注册表查询失败");
+{
+  const { payload } = await call("GET", "/list");
+  check("一个 cwd 失败不影响整体", payload.result.registryAvailable === true);
+  check("其它 cwd 的注册表条目仍在", payload.result.skills.some((skill) => skill.name === "acl-doctor"));
+  check("磁盘扫描照旧", payload.result.skills.some((skill) => skill.name === "find-skills"));
 }
 
 // ---- registry 缺席时的降级 ----------------------------------------------
